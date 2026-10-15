@@ -24,7 +24,7 @@
     <main class="main-content">
       <header class="topbar"><div><span class="breadcrumb">科研证据综述 /</span><strong id="viewTitle">研究问题输入</strong></div><div class="top-actions"><span class="run-id" id="runId">尚未开始</span><span class="experiment-badge" id="experimentBadge">待分组</span><button class="ghost-button" id="agentBtn">Agent</button><button class="ghost-button" id="activityBtn">监控面板</button><button class="avatar">荣</button></div></header>
       <div class="progress-strip"><div class="progress-label"><span>流水线进度</span><strong id="progressText">协议待确认</strong></div><div class="progress-track"><span id="progressBar" style="width:12%"></span></div><div class="progress-meta"><span id="stageCount">1 / 5</span><span class="sync-label"><span class="live-dot"></span>实时同步</span></div></div>
-      <div class="demo-notice" id="evidenceModeNotice"><strong>运行边界</strong><span>协议生成与 Agent 对话由服务端大模型执行。当前论文、提取和创新性页面是界面演示数据，只有云端 Elicit / Edison MCP 凭据配置后才会显示真实证据。</span></div>
+      <div class="demo-notice" id="evidenceModeNotice"><strong>运行边界</strong><span>协议生成与 Agent 对话由 Cloudflare Workers AI 执行。免费 MVP 的候选论文来自 OpenAlex 公共 API；Elicit / Edison MCP 未接入，所有论文事实仍需按 DOI / URL 人工核验。</span></div>
 
       <section class="view active" id="view-question">
         <div class="page-intro"><div><span class="kicker">PHASE 01 · PROTOCOL</span><h1>把研究问题变成可执行的检索协议</h1><p>先确认研究边界、纳入标准和证据类型，Supervisor 才会启动后续 Worker。</p></div><div class="audit-chip"><span>来源追踪</span><strong id="protocolSourceLabel">等待服务端模型</strong></div></div>
