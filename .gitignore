@@ -9,8 +9,12 @@ feedback/
 
 # Local environment and editor files
 .env
+.dev.vars
 .venv/
 venv/
+node_modules/
+.wrangler/
+.wrangler-dist/
 .idea/
 .vscode/
 
