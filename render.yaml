@@ -3,7 +3,7 @@ services:
     name: research-evidence-agent
     runtime: python
     plan: free
-    buildCommand: ""
+    buildCommand: python3 -m pip install --upgrade pip uv
     startCommand: python3 ui/server.py
     healthCheckPath: /api/health
     envVars:
@@ -15,3 +15,11 @@ services:
         value: gpt-5-mini
       - key: REA_MODEL_REQUESTS_PER_HOUR
         value: "20"
+      - key: ELICIT_MCP_TOKEN
+        sync: false
+      - key: EDISON_API_KEY
+        sync: false
+      - key: EDISON_MCP_COMMAND
+        value: uvx
+      - key: EDISON_MCP_ARGS
+        value: edison-mcp@latest stdio

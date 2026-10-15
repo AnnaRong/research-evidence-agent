@@ -5,6 +5,7 @@ An auditable literature-research web agent built around a server-side LLM Superv
 ## Features
 
 - Server-side OpenAI or Anthropic model integration for protocol generation and Agent chat.
+- Server-side MCP Runner for live Elicit and Edison Worker calls.
 - Research-question protocol generation and human confirmation gates.
 - Search and screening workspace with PRISMA progress.
 - Editable evidence extraction with confidence and source spans.
@@ -24,6 +25,8 @@ Configure one public, server-side model credential. Never put the key in fronten
 export OPENAI_API_KEY="..."
 export OPENAI_MODEL="gpt-5-mini"
 # Or: ANTHROPIC_API_KEY and ANTHROPIC_MODEL
+export ELICIT_MCP_TOKEN="..."
+export EDISON_API_KEY="..."
 ```
 
 Without a configured model, `/api/protocol` and `/api/agent/chat` return HTTP 503. The application does not silently fall back to a rule template.
@@ -34,13 +37,13 @@ Without a configured model, `/api/protocol` and `/api/agent/chat` return HTTP 50
 
 The free Render filesystem is ephemeral. SQLite checkpoints survive browser refreshes but may be lost on service restart or redeploy. Use a persistent disk or external database before calling the deployment durable production storage.
 
-## Run Locally
+## Local Verification Only
 
 ```bash
 python3 ui/server.py 4174
 ```
 
-Open `http://127.0.0.1:4174`.
+Opening `http://127.0.0.1:4174` is only for development verification. The intended user-facing deployment is the Render service described above.
 
 ## Tests
 
@@ -54,4 +57,4 @@ python3 -m unittest discover -s tests -v
 
 See `mcp-config.example.json` and `references/mcp-routing.md` for the Elicit and Edison MCP routes. Credentials are intentionally not stored in this repository.
 
-The protocol and chat routes execute a real server-side LLM. The current search, extraction, novelty, and synthesis screens still contain explicitly labelled demonstration records until a cloud MCP runner is configured. Do not treat those records as Elicit/Edison results.
+The protocol and chat routes execute a real server-side LLM. `/api/agent/run` executes the configured MCP Worker and persists raw outputs, session IDs, paper candidates, and DOI/URL citations into the task checkpoint. The UI starts SearchWorker after protocol confirmation and uses returned MCP candidates when available. If MCP credentials are absent, the task is paused with a configuration error; demonstration records are explicitly labelled and must not be treated as Elicit/Edison results.

@@ -28,6 +28,8 @@ MODEL_RATE_LOCK = threading.Lock()
 MODEL_REQUESTS = {}
 sys.path.insert(0, str(REPO / "scripts"))
 from model_agent import ModelError, agent_reply, generate_protocol_with_model, model_status
+from agent_pipeline import AgentPipeline
+from mcp_client import mcp_config
 
 
 def utc_now():
@@ -170,17 +172,21 @@ class TaskStore:
         if "input_data" in changes:
             fields.append("input_json = ?")
             values.append(self._json(changes["input_data"]))
-        if "state" in changes:
-            fields.append("state_json = ?")
-            values.append(self._json(changes["state"]))
         if "error" in changes:
             fields.append("error_json = ?")
             values.append(self._json(changes["error"]) if changes["error"] is not None else None)
         fields.append("updated_at = ?")
         values.extend([utc_now(), task_id])
         with FEEDBACK_LOCK, self._connect() as connection:
-            if not connection.execute("SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)).fetchone():
+            existing = connection.execute("SELECT state_json FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if not existing:
                 raise KeyError("Unknown task: {}".format(task_id))
+            if "state" in changes:
+                previous_state = json.loads(existing[0] or "{}")
+                merged_state = dict(previous_state)
+                merged_state.update(changes["state"] or {})
+                fields.insert(0, "state_json = ?")
+                values.insert(0, self._json(merged_state))
             connection.execute("UPDATE tasks SET {} WHERE task_id = ?".format(", ".join(fields)), values)
             self._event(connection, task_id, "checkpoint", {key: value for key, value in changes.items() if key not in {"input_data", "state", "error"}})
             return self._decode(connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone())
@@ -479,6 +485,9 @@ def telemetry_event(payload, analytics_dir=ANALYTICS_DIR):
     }
     append_jsonl(analytics_dir / "events.jsonl", event)
     return {"recorded": True, "event": event}
+
+
+PIPELINE = AgentPipeline(TASK_STORE, telemetry_event, TASK_STORE.checkpoint)
 
 
 def satisfaction_feedback(payload, analytics_dir=ANALYTICS_DIR):
@@ -847,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/health":
-            self._send_json({"status": "ok", "mode": "public-agent", "model": model_status()})
+            self._send_json({"status": "ok", "mode": "public-agent", "model": model_status(), "mcp": mcp_config(), "pipeline": {"search": "live MCP required", "workers": ["SearchWorker", "ScreeningWorker", "ExtractionWorker", "NoveltyWorker", "SynthesisWorker"]}})
             return
         if path == "/api/feedback/summary":
             self.send_bytes(json.dumps(feedback_summary(), ensure_ascii=False).encode(), "application/json; charset=utf-8")
@@ -948,6 +957,23 @@ class Handler(BaseHTTPRequestHandler):
             TASK_STORE.checkpoint(task_id, state=state)
             telemetry_event({"task_id": task_id, "event_type": "agent_message_completed", "stage": task.get("stage"), "status": "completed", "model": model_status()})
             self._send_json({"reply": reply, "model": model_status(), "task_id": task_id, "evidence_type": "model_advice"})
+            return
+        if self.path == "/api/agent/run":
+            task_id = str(payload.get("task_id", "")).strip()
+            stage = str(payload.get("stage", "search")).strip()
+            question = str(payload.get("question", "")).strip()
+            if not task_id or not stage or not question:
+                self._send_error("task_id_stage_and_question_required", 400)
+                return
+            task = TASK_STORE.get(task_id)
+            if not task:
+                self._send_error("unknown_task", 404)
+                return
+            if not mcp_config()["elicit"] and not mcp_config()["edison"]:
+                self._send_json({"error": "mcp_not_configured", "message": "Elicit/Edison MCP credentials are not configured on the server.", "mcp": mcp_config()}, 503)
+                return
+            result = PIPELINE.start(task_id, stage, question, payload.get("protocol") or (task.get("state") or {}).get("protocol") or {}, payload.get("contribution"))
+            self._send_json(result)
             return
         if self.path == "/api/tasks":
             try:

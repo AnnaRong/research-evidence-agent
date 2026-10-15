@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "ui"))
 
 import model_agent
 import server
+from agent_pipeline import AgentPipeline
 
 
 class ModelAgentTest(unittest.TestCase):
@@ -76,6 +77,24 @@ class ModelAgentTest(unittest.TestCase):
             self.assertTrue(server.allow_model_request("client", now=100)[0])
             self.assertTrue(server.allow_model_request("client", now=101)[0])
             self.assertFalse(server.allow_model_request("client", now=102)[0])
+
+    def test_pipeline_search_persists_real_mcp_candidates(self):
+        import tempfile
+        from server import TaskStore
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = TaskStore(Path(temporary) / "state.sqlite3")
+            store.create(task_id="pipeline-task", experiment_group="control")
+            events = []
+            checkpoints = []
+            pipeline = AgentPipeline(store, events.append, lambda task_id, **changes: checkpoints.append((task_id, changes)) or store.checkpoint(task_id, **changes))
+            raw = {"server": "elicit", "tool": "search_papers", "session_id": "elicit-session", "result": {"content": [{"type": "text", "text": json.dumps({"papers": [{"title": "A real paper", "doi": "10.1234/real.paper", "abstract": "Evidence"}]})}]}, "text": "A real paper 10.1234/real.paper"}
+            with patch.dict("os.environ", {"ELICIT_MCP_TOKEN": "test-token", "EDISON_API_KEY": ""}, clear=False), patch("agent_pipeline.call_tool", return_value=raw), patch("agent_pipeline.mcp_config", return_value={"elicit": True, "edison": False, "elicit_url": "https://elicit.com/api/mcp"}):
+                pipeline.search("pipeline-task", "Question", {"query": "question"})
+            task = store.get("pipeline-task")
+            self.assertEqual(task["status"], "needs_attention")
+            self.assertEqual(task["state"]["candidates"][0]["doi"], "10.1234/real.paper")
+            self.assertEqual(task["state"]["mcp_calls"][0]["session_id"], "elicit-session")
 
 
 if __name__ == "__main__":
