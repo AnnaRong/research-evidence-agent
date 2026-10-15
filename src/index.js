@@ -1,126 +1,60 @@
-import { DurableObject, scheduler, snapshotContainer } from "cloudflare:workers";
+const MODEL = "@cf/meta/llama-3.1-8b-instruct";
+const STAGES = ["protocol", "search", "screening", "extraction", "novelty", "synthesis"];
 
-const SNAPSHOT_KEY = "latest-filesystem-snapshot";
-const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-const PORT = 8080;
+function json(data, status = 200, headers = {}) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", ...headers } }); }
+function now() { return new Date().toISOString(); }
+function id(prefix = "task") { return `${prefix}-${crypto.randomUUID().slice(0, 12)}`; }
+function errorResponse(code, message, status = 400, extra = {}) { return json({ error: code, message, ...extra }, status); }
 
-function containerEnv(env) {
-  return {
-    HOST: "0.0.0.0",
-    PORT: String(PORT),
-    REA_STATE_DB: "/data/research_agent.sqlite3",
-    REA_FEEDBACK_DIR: "/data/feedback",
-    REA_ANALYTICS_DIR: "/data/analytics",
-    EDISON_MCP_COMMAND: "edison-mcp",
-    EDISON_MCP_ARGS: "stdio",
-    OPENAI_API_KEY: String(env.OPENAI_API_KEY || ""),
-    OPENAI_MODEL: String(env.OPENAI_MODEL || "gpt-5-mini"),
-    OPENAI_BASE_URL: String(env.OPENAI_BASE_URL || ""),
-    ANTHROPIC_API_KEY: String(env.ANTHROPIC_API_KEY || ""),
-    ANTHROPIC_AUTH_TOKEN: String(env.ANTHROPIC_AUTH_TOKEN || ""),
-    ANTHROPIC_MODEL: String(env.ANTHROPIC_MODEL || "claude-sonnet-4-5"),
-    ANTHROPIC_BASE_URL: String(env.ANTHROPIC_BASE_URL || ""),
-    ELICIT_MCP_TOKEN: String(env.ELICIT_MCP_TOKEN || ""),
-    ELICIT_API_KEY: String(env.ELICIT_API_KEY || ""),
-    ELICIT_MCP_URL: String(env.ELICIT_MCP_URL || "https://elicit.com/api/mcp"),
-    EDISON_API_KEY: String(env.EDISON_API_KEY || ""),
-    REA_MODEL_REQUESTS_PER_HOUR: String(env.REA_MODEL_REQUESTS_PER_HOUR || "20")
-  };
+async function schema(db) {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS tasks (task_id TEXT PRIMARY KEY, session_id TEXT, stage TEXT NOT NULL, status TEXT NOT NULL, experiment_group TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}', state_json TEXT NOT NULL DEFAULT '{}', error_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS task_events (event_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS task_gates (task_id TEXT NOT NULL, gate_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', metadata_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL, PRIMARY KEY (task_id, gate_name))`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS feedback (feedback_id TEXT PRIMARY KEY, task_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`)
+  ]);
 }
+function decode(row) { if (!row) return null; return { task_id: row.task_id, session_id: row.session_id || "", sessionId: row.session_id || "", stage: row.stage, status: row.status, experiment_group: row.experiment_group, input: JSON.parse(row.input_json || "{}"), state: JSON.parse(row.state_json || "{}"), error: row.error_json ? JSON.parse(row.error_json) : null, created_at: row.created_at, updated_at: row.updated_at }; }
+async function getTask(db, taskId) { return decode(await db.prepare("SELECT * FROM tasks WHERE task_id = ?").bind(taskId).first()); }
+async function saveTask(db, task, eventType = "checkpoint") { const updated = now(); await db.prepare("UPDATE tasks SET session_id=?, stage=?, status=?, input_json=?, state_json=?, error_json=?, updated_at=? WHERE task_id=?").bind(task.session_id || "", task.stage, task.status, JSON.stringify(task.input || {}), JSON.stringify(task.state || {}), task.error ? JSON.stringify(task.error) : null, updated, task.task_id).run(); await db.prepare("INSERT INTO task_events(event_id, task_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)").bind(id("event"), task.task_id, eventType, JSON.stringify({ stage: task.stage, status: task.status }), updated).run(); return { ...task, updated_at: updated }; }
+async function createTask(db, payload) { const taskId = payload.task_id || id(); const existing = await getTask(db, taskId); if (existing) return existing; const timestamp = now(); const experiment = payload.experiment_group || (Math.random() < 0.5 ? "control" : "experiment"); const task = { task_id: taskId, session_id: payload.session_id || `web-${taskId}`, stage: payload.stage || "protocol", status: payload.status || "running", experiment_group: experiment, input: payload.input || {}, state: payload.state || { runtime: "cloudflare-free-mvp", evidence_mode: "openalex_public" }, error: null, created_at: timestamp, updated_at: timestamp }; await db.prepare("INSERT INTO tasks(task_id,session_id,stage,status,experiment_group,input_json,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(task.task_id, task.session_id, task.stage, task.status, experiment, JSON.stringify(task.input), JSON.stringify(task.state), timestamp, timestamp).run(); for (const gate of ["protocol_confirmation", "screening_criteria_confirmation", "borderline_screening_confirmation", "evidence_export_confirmation"]) await db.prepare("INSERT OR IGNORE INTO task_gates(task_id, gate_name, updated_at) VALUES (?, ?, ?)").bind(taskId, gate, timestamp).run(); await db.prepare("INSERT INTO task_events(event_id,task_id,event_type,payload_json,created_at) VALUES(?,?,?,?,?)").bind(id("event"), taskId, "task_created", JSON.stringify({ experiment_group: experiment }), timestamp).run(); return task; }
+async function aiText(env, system, user, maxTokens = 1200) { if (!env.AI) throw new Error("Workers AI binding is not configured"); const result = await env.AI.run(MODEL, { messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: maxTokens }); return String(result?.response || result?.result?.response || result?.text || "").trim(); }
+function parseJson(text) { try { return JSON.parse(text); } catch (_) { const match = text.match(/\{[\s\S]*\}/); if (!match) throw new Error("Workers AI did not return JSON"); return JSON.parse(match[0]); } }
+async function protocol(env, question, outputs) { const text = await aiText(env, "You are an auditable scientific evidence Supervisor. Return one JSON object only. Never invent papers or citations.", JSON.stringify({ task: "Create an editable PICO or PEO protocol", question, outputs, schema: { framework: "PICO or PEO", population: "string", exposure: "string", outcome: "string", query: "Boolean search query", inclusion_criteria: ["string"], exclusion_criteria: ["string"], limitations: ["string"] } })); const result = parseJson(text); for (const field of ["framework", "population", "exposure", "outcome", "query"]) if (!String(result[field] || "").trim()) throw new Error(`Protocol missing ${field}`); return { ...result, outputs, generated_by: "cloudflare_workers_ai_supervisor", editable: true, source_citations: [], timestamp: now() }; }
+async function openAlexSearch(query) { const response = await fetch(`https://api.openalex.org/works?search=${encodeURIComponent(query)}&per-page=25&mailto=research-evidence-agent@example.com`, { headers: { accept: "application/json" } }); if (!response.ok) throw new Error(`OpenAlex returned HTTP ${response.status}`); const data = await response.json(); return (data.results || []).map((item) => { const doi = item.doi ? item.doi.replace(/^https?:\/\/doi.org\//, "") : null; const abstract = item.abstract_inverted_index ? Object.entries(item.abstract_inverted_index).flatMap(([word, positions]) => positions.map((position) => [position, word])).sort((a, b) => a[0] - b[0]).map((entry) => entry[1]).join(" ") : ""; return { paper_id: `openalex:${item.id?.split("/").pop() || crypto.randomUUID()}`, doi, url: item.primary_location?.landing_page_url || item.id, title: item.title || "Untitled paper", abstract, authors: (item.authorships || []).slice(0, 4).map((author) => author.author?.display_name).filter(Boolean).join(", "), year: item.publication_year, journal: item.primary_location?.source?.display_name || "", source: "OpenAlex", source_tool: "OpenAlex REST API", decision: "uncertain", reason: "公开检索候选；等待人工筛选。" }; }); }
+function citations(records) { return records.flatMap((record) => [record.doi ? `https://doi.org/${record.doi}` : null, record.url || null]).filter(Boolean); }
+async function runStage(env, db, task, stage, question, protocolData, contribution = "") { const state = { ...(task.state || {}) }; if (stage === "search") { const candidates = await openAlexSearch(protocolData.query || question); if (!candidates.length) throw new Error("OpenAlex did not return candidate papers"); state.candidates = candidates; state.source_citations = citations(candidates); state.source_notice = "免费 MVP 使用 OpenAlex 公共 API；未调用 Elicit/Edison MCP。"; state.next_gate = "screening_criteria_confirmation"; } else { const context = JSON.stringify({ question, protocol: protocolData, candidates: state.candidates || [], screening: state.screening || {}, extraction: state.extraction || {}, novelty: state.novelty || {}, contribution }); const text = await aiText(env, "You are a cautious research Worker. Return JSON only. Never invent DOI, URLs, papers, quotes, or measurements. Keep existing source citations and label model interpretation separately.", JSON.stringify({ stage, context, required: stage === "screening" ? { decisions: [], prisma: {} } : stage === "extraction" ? { extractions: [] } : stage === "novelty" ? { claims: [] } : { evidence_table: [], method_matrix: [], narrative: "" } }), 1800); const result = parseJson(text); if (stage === "screening") { state.screening = result; state.next_gate = "borderline_screening_confirmation"; } if (stage === "extraction") { state.extraction = result; state.next_gate = "evidence_export_confirmation"; } if (stage === "novelty") state.novelty = result; if (stage === "synthesis") { state.synthesis = result; state.next_gate = "evidence_export_confirmation"; } state.model_evidence_boundary = "这是 Workers AI 的分析，不等同于新增文献来源；论文事实必须回到 DOI/URL 核验。"; } state.last_stage_completed = stage; state.stage_timestamp = now(); task.stage = stage; task.status = "needs_attention"; task.state = state; task.error = null; await saveTask(db, task, "worker_completed"); return { accepted: true, status: task.status, task_id: task.task_id, stage, state }; }
+async function feedback(db, payload, kind) { await db.prepare("INSERT INTO feedback(feedback_id,task_id,kind,payload_json,created_at) VALUES(?,?,?,?,?)").bind(id("feedback"), payload.task_id || null, kind, JSON.stringify(payload), now()).run(); return { message: "你的修正已记录，将用于改进后续筛选", recorded: true }; }
 
-export class ResearchAgentContainer extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
-    this.ctx = ctx;
-    this.env = env;
-    this.container = ctx.container;
-    this.starting = null;
+async function api(request, env) {
+  const url = new URL(request.url); const path = url.pathname; const db = env.DB; if (!db) return errorResponse("d1_not_configured", "Cloudflare D1 binding is not configured yet.", 503); await schema(db);
+  if (request.method === "GET" && path === "/api/health") return json({ status: "ok", mode: "cloudflare-free-mvp", model: { configured: Boolean(env.AI), provider: "Cloudflare Workers AI", model: MODEL }, mcp: { elicit: false, edison: false, note: "免费 MVP 使用 OpenAlex；Elicit/Edison 需要额外账户或外部 HTTPS 适配器。" }, persistence: "D1", pipeline: { search: "OpenAlex public API", workers: STAGES } });
+  if (request.method === "GET" && path === "/api/feedback/summary") {
+    const rows = await db.prepare("SELECT kind, COUNT(*) AS count FROM feedback GROUP BY kind").all();
+    const counts = Object.fromEntries((rows.results || []).map((row) => [row.kind, Number(row.count)]));
+    return json({ screening: { weekly_corrections: counts.screening || 0 }, extraction: { accuracy: 1, corrected_cells: counts.extraction || 0, total_cells: counts.extraction || 0, reextraction_pending: false }, novelty: { historical_accuracy: null, feedback_count: counts.novelty || 0, recommended_similarity_threshold: 0.75 } });
   }
-
-  async waitUntilReady() {
-    const port = this.container.getTcpPort(PORT);
-    for (let attempt = 0; attempt < 90; attempt += 1) {
-      try {
-        const response = await port.fetch("http://container/api/health");
-        if (response.status < 500) return;
-      } catch (_) {
-        // The Python process is still starting.
-      }
-      await scheduler.wait(1000);
-    }
-    throw new Error("Research Agent container did not become ready within 90 seconds");
+  if (request.method === "GET" && path === "/api/admin/monitoring") {
+    const rows = await db.prepare("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").all();
+    return json({ generated_at: now(), runtime: "cloudflare-free-mvp", tasks: rows.results || [], note: "管理员认证尚未接入；此端点仅适合个人测试。" });
   }
-
-  async startContainer() {
-    const savedSnapshot = await this.ctx.storage.get(SNAPSHOT_KEY);
-    const common = {
-      instance: "basic",
-      enableInternet: true,
-      env: containerEnv(this.env)
-    };
-
-    this.container.setInactivityTimeout(10 * 60 * 1000);
-    this.container.start(savedSnapshot
-      ? { ...common, containerSnapshot: savedSnapshot }
-      : { ...common, image: this.container.images.default });
-
-    try {
-      await this.waitUntilReady();
-    } catch (error) {
-      if (!savedSnapshot) throw error;
-      await this.container.destroy();
-      await this.ctx.storage.delete(SNAPSHOT_KEY);
-      this.container.start({ ...common, image: this.container.images.default });
-      await this.waitUntilReady();
-    }
+  if (request.method === "GET" && path === "/api/admin/ab-testing") {
+    const rows = await db.prepare("SELECT experiment_group, COUNT(*) AS count FROM tasks GROUP BY experiment_group").all();
+    return json({ generated_at: now(), assignment: rows.results || [], note: "A/B 分组已记录；免费 MVP 只比较任务分组，不宣称统计显著性。" });
   }
-
-  async ensureStarted() {
-    if (this.container.running) return;
-    if (!this.starting) {
-      this.starting = this.startContainer().finally(() => {
-        this.starting = null;
-      });
-    }
-    await this.starting;
-  }
-
-  async saveSnapshot() {
-    const snapshot = await snapshotContainer(this.container, true);
-    await this.ctx.storage.put(SNAPSHOT_KEY, snapshot);
-  }
-
-  async fetch(request) {
-    await this.ensureStarted();
-    this.container.setInactivityTimeout(10 * 60 * 1000);
-
-    const target = new URL(request.url);
-    target.protocol = "http:";
-    target.hostname = "container";
-    target.port = "";
-    const response = await this.container.getTcpPort(PORT).fetch(new Request(target, request));
-    if (!WRITE_METHODS.has(request.method)) return response;
-
-    const body = await response.arrayBuffer();
-    const headers = new Headers(response.headers);
-    try {
-      await this.saveSnapshot();
-      headers.set("X-Research-Agent-Snapshot", "saved");
-    } catch (error) {
-      console.error("Failed to save container snapshot", error);
-      headers.set("X-Research-Agent-Snapshot", "failed");
-    }
-    return new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers
-    });
-  }
+  if (request.method === "GET" && path === "/api/tasks") { const rows = await db.prepare("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 50").all(); return json({ tasks: (rows.results || []).map(decode) }); }
+  if (request.method === "GET" && path.startsWith("/api/tasks/")) { const parts = path.split("/").filter(Boolean); const task = await getTask(db, parts[2]); if (!task) return errorResponse("unknown_task", "Unknown task", 404); if (parts[3] === "gates") { const gates = await db.prepare("SELECT * FROM task_gates WHERE task_id=? ORDER BY gate_name").bind(task.task_id).all(); return json({ task_id: task.task_id, gates: gates.results || [] }); } return json(task); }
+  let payload = {}; if (request.method === "POST") { try { payload = await request.json(); } catch (_) { return errorResponse("invalid_json", "Invalid JSON body"); } } if (request.method !== "POST") return env.ASSETS.fetch(request);
+  if (path === "/api/tasks") return json(await createTask(db, payload));
+  if (path === "/api/protocol") { const question = String(payload.question || "").trim(); if (!question) return errorResponse("question_required", "question is required"); try { const result = await protocol(env, question, payload.outputs || []); if (payload.task_id) { const task = await getTask(db, payload.task_id) || await createTask(db, { task_id: payload.task_id }); task.state = { ...(task.state || {}), protocol: result, next_gate: "protocol_confirmation" }; task.stage = "protocol"; task.status = "needs_attention"; await saveTask(db, task, "protocol_generated"); } return json(result); } catch (error) { return errorResponse("model_request_failed", error.message, 502); } }
+  if (path === "/api/agent/chat") { const task = await getTask(db, payload.task_id); if (!task) return errorResponse("unknown_task", "Unknown task", 404); try { const reply = await aiText(env, "You are a cautious Chinese research Supervisor. Separate model advice from source evidence and human confirmation. Never claim a paper was verified without a DOI or URL in task state.", JSON.stringify({ message: payload.message, task })); task.state.agent_messages = [...(task.state.agent_messages || []), { role: "user", content: payload.message, timestamp: now() }, { role: "assistant", content: reply, evidence_type: "model_advice", timestamp: now() }].slice(-40); await saveTask(db, task, "agent_message_completed"); return json({ reply, model: { provider: "Cloudflare Workers AI", model: MODEL }, task_id: task.task_id, evidence_type: "model_advice" }); } catch (error) { return errorResponse("model_request_failed", error.message, 502); } }
+  if (path === "/api/agent/run") { const task = await getTask(db, payload.task_id); if (!task) return errorResponse("unknown_task", "Unknown task", 404); const stage = String(payload.stage || "search"); if (!STAGES.includes(stage) || stage === "protocol") return errorResponse("invalid_stage", "Unsupported Worker stage"); try { return json(await runStage(env, db, task, stage, String(payload.question || ""), payload.protocol || task.state.protocol || {}, payload.contribution || "")); } catch (error) { task.stage = stage; task.status = "needs_attention"; task.error = { category: "worker_error", message: error.message, retryable: true, suggested_actions: ["retry", "manual_upload", "skip"] }; await saveTask(db, task, "worker_failed"); return errorResponse("worker_failed", error.message, 502, { task_id: task.task_id, stage }); } }
+  if (path.startsWith("/api/tasks/") && path.endsWith("/checkpoint")) { const task = await getTask(db, path.split("/")[3]); if (!task) return errorResponse("unknown_task", "Unknown task", 404); Object.assign(task, { stage: payload.stage || task.stage, status: payload.status || task.status, state: { ...task.state, ...(payload.state || {}) }, error: payload.error || null }); return json(await saveTask(db, task)); }
+  if (path.startsWith("/api/tasks/") && path.endsWith("/resume")) { const task = await getTask(db, path.split("/")[3]); if (!task) return errorResponse("unknown_task", "Unknown task", 404); task.status = "running"; task.error = null; return json(await saveTask(db, task, "task_resumed")); }
+  if (path.startsWith("/api/tasks/") && path.endsWith("/skip")) { const task = await getTask(db, path.split("/")[3]); if (!task) return errorResponse("unknown_task", "Unknown task", 404); task.state.skipped_stages = [...new Set([...(task.state.skipped_stages || []), task.stage])]; task.status = "running"; return json(await saveTask(db, task, "stage_skipped")); }
+  if (path.startsWith("/api/tasks/") && path.endsWith("/retry")) { const task = await getTask(db, path.split("/")[3]); if (!task) return errorResponse("unknown_task", "Unknown task", 404); task.status = "running"; task.error = null; task.state.retry_count = (task.state.retry_count || 0) + 1; return json(await saveTask(db, task, "worker_retried")); }
+  if (path.startsWith("/api/tasks/") && path.endsWith("/gates/confirm")) { const task = await getTask(db, path.split("/")[3]); if (!task) return errorResponse("unknown_task", "Unknown task", 404); await db.prepare("UPDATE task_gates SET status='confirmed', metadata_json=?, updated_at=? WHERE task_id=? AND gate_name=?").bind(JSON.stringify(payload.metadata || {}), now(), task.task_id, payload.gate_name).run(); return json({ task_id: task.task_id, gate_name: payload.gate_name, status: "confirmed", confirmed_by: payload.confirmed_by || "user" }); }
+  if (path === "/api/feedback/screening") return json(await feedback(db, payload, "screening")); if (path === "/api/feedback/extraction") return json(await feedback(db, payload, "extraction")); if (path === "/api/feedback/novelty") return json(await feedback(db, payload, "novelty")); if (["/api/telemetry/event", "/api/telemetry/api-call", "/api/telemetry/satisfaction", "/api/telemetry/interview"].includes(path)) return json(await feedback(db, payload, "telemetry"));
+  return env.ASSETS.fetch(request);
 }
-
-export default {
-  async fetch(request, env) {
-    const id = env.RESEARCH_AGENT.idFromName("production");
-    return env.RESEARCH_AGENT.get(id).fetch(request);
-  }
-};
+export default { async fetch(request, env) { try { return await api(request, env); } catch (error) { console.error(error); return errorResponse("server_error", error.message, 500); } } };

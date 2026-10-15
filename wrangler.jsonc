@@ -1,34 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "research-evidence-agent",
+  "name": "research-evidence-agent-free",
   "main": "src/index.js",
   "compatibility_date": "2026-10-15",
-  "containers": [
-    {
-      "class_name": "ResearchAgentContainer",
-      "image": "./Dockerfile",
-      "instance_type": "basic",
-      "max_instances": 1
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "RESEARCH_AGENT",
-        "class_name": "ResearchAgentContainer"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["ResearchAgentContainer"]
-    }
-  ],
-  "vars": {
-    "OPENAI_MODEL": "gpt-5-mini",
-    "ANTHROPIC_MODEL": "claude-sonnet-4-5",
-    "REA_MODEL_REQUESTS_PER_HOUR": "20",
-    "ELICIT_MCP_URL": "https://elicit.com/api/mcp"
-  }
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "./ui", "binding": "ASSETS" },
+  "ai": { "binding": "AI" },
+  "d1_databases": [{ "binding": "DB", "database_name": "research-evidence-agent", "database_id": "REPLACE_WITH_D1_DATABASE_ID", "migrations_dir": "migrations" }]
 }
