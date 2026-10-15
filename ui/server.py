@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local UI server for the Research Evidence Agent demo."""
+"""Public-capable web server for the Research Evidence Agent."""
 
 import json
 import mimetypes
@@ -9,6 +9,7 @@ import sqlite3
 import statistics
 import sys
 import threading
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -23,12 +24,29 @@ FEEDBACK_DIR = Path(os.environ.get("REA_FEEDBACK_DIR", REPO / "feedback"))
 ANALYTICS_DIR = Path(os.environ.get("REA_ANALYTICS_DIR", REPO / "analytics"))
 STATE_DB = Path(os.environ.get("REA_STATE_DB", REPO / "state" / "research_agent.sqlite3"))
 FEEDBACK_LOCK = threading.Lock()
+MODEL_RATE_LOCK = threading.Lock()
+MODEL_REQUESTS = {}
 sys.path.insert(0, str(REPO / "scripts"))
-from supervisor import generate_protocol
+from model_agent import ModelError, agent_reply, generate_protocol_with_model, model_status
 
 
 def utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def allow_model_request(client_id, now=None):
+    """Bound public model spend with a small per-client rolling-hour limit."""
+    limit = max(1, int(os.environ.get("REA_MODEL_REQUESTS_PER_HOUR", "20")))
+    now = now or time.time()
+    cutoff = now - 3600
+    with MODEL_RATE_LOCK:
+        recent = [timestamp for timestamp in MODEL_REQUESTS.get(client_id, []) if timestamp >= cutoff]
+        if len(recent) >= limit:
+            MODEL_REQUESTS[client_id] = recent
+            return False, limit
+        recent.append(now)
+        MODEL_REQUESTS[client_id] = recent
+        return True, limit
 
 
 class TaskStore:
@@ -797,14 +815,21 @@ def docx_bytes(text):
 def bundle_bytes():
     output = BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("evidence-table.csv", "论文,研究设计,样本量,人群/地域,暴露变量,结局变量,统计方法,偏倚风险,来源\nCompound climate extremes and alpine productivity,遥感面板,2416,青藏高原草地,热旱复合指数,NPP / 恢复力,GAM + 空间滞后,低,DOI:10.1000/example.1; Results Table 2\n")
-        archive.writestr("screening-decisions.csv", "paper_id,decision,reason,source\np1,include,Meets eligibility criteria,Elicit DOI:10.1000/example.1\n")
-        archive.writestr("novelty-report.md", "# Novelty Analysis\n\nScore: 76/100\n\nVerdict: partial_precedent\n\n## Sources\n- Edison Precedent Search: precedent-01\n- Edison Precedent Search: precedent-02\n")
-        archive.writestr("sources.json", json.dumps({"generated_at": utc_now(), "sources": ["DOI:10.1000/example.1", "Elicit", "Edison Precedent Search"]}, ensure_ascii=False, indent=2))
+        archive.writestr("evidence-table.csv", "演示状态,论文,研究设计,样本量,人群/地域,暴露变量,结局变量,统计方法,偏倚风险,来源\n演示样例,Compound climate extremes and alpine productivity,遥感面板,2416,青藏高原草地,热旱复合指数,NPP / 恢复力,GAM + 空间滞后,低,无真实 DOI；待 MCP 替换\n")
+        archive.writestr("screening-decisions.csv", "paper_id,decision,reason,source\np1,include,Demo decision,DEMO ONLY; no MCP citation\n")
+        archive.writestr("novelty-report.md", "# Novelty Analysis\n\nDemo only. No Edison Precedent task has been executed.\n\n## Sources\n\nNo real MCP citations are present.\n")
+        archive.writestr("sources.json", json.dumps({"generated_at": utc_now(), "demo": True, "sources": [], "warning": "No real MCP citations are present."}, ensure_ascii=False, indent=2))
     return output.getvalue()
 
 
 class Handler(BaseHTTPRequestHandler):
+    def model_request_allowed(self):
+        forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        allowed, limit = allow_model_request(forwarded or self.client_address[0])
+        if not allowed:
+            self._send_json({"error": "model_rate_limit", "message": "Model request limit reached.", "limit_per_hour": limit}, 429)
+        return allowed
+
     def send_bytes(self, data, content_type, filename=None):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -822,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/health":
-            self.send_bytes(b'{"status":"ok","mode":"local-supervisor"}', "application/json; charset=utf-8")
+            self._send_json({"status": "ok", "mode": "public-agent", "model": model_status()})
             return
         if path == "/api/feedback/summary":
             self.send_bytes(json.dumps(feedback_summary(), ensure_ascii=False).encode(), "application/json; charset=utf-8")
@@ -862,15 +887,67 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(file_path.read_bytes(), mimetypes.guess_type(file_path.name)[0] or "application/octet-stream")
 
     def do_POST(self):
-        payload = self.json_body()
+        try:
+            payload = self.json_body()
+        except (json.JSONDecodeError, ValueError):
+            self._send_error("invalid_json", 400)
+            return
         if self.path == "/api/protocol":
-            result = generate_protocol(payload.get("question", ""), payload.get("outputs"))
+            question = str(payload.get("question", "")).strip()
+            if not question:
+                self._send_error("question_required", 400)
+                return
+            if not model_status()["configured"]:
+                self._send_json({"error": "model_not_configured", "message": "A server-side model API key is required."}, 503)
+                return
+            if not self.model_request_allowed():
+                return
+            try:
+                result = generate_protocol_with_model(question, payload.get("outputs") or [])
+            except ModelError as exc:
+                self._send_json({"error": "model_request_failed", "message": str(exc)}, 502)
+                return
+            result["timestamp"] = utc_now()
             task_id = payload.get("task_id")
             if task_id:
                 if not TASK_STORE.get(task_id):
-                    TASK_STORE.create(task_id=task_id, session_id=payload.get("session_id"), stage="protocol", status="running", input_data={"question": payload.get("question"), "outputs": payload.get("outputs")})
-                TASK_STORE.checkpoint(task_id, stage="protocol", status="needs_attention", state={"protocol": result, "next_gate": "protocol_confirmation"})
+                    TASK_STORE.create(task_id=task_id, session_id=payload.get("session_id"), stage="protocol", status="running", input_data={"question": question, "outputs": payload.get("outputs")})
+                task = TASK_STORE.get(task_id)
+                state = dict(task.get("state") or {})
+                state.update({"protocol": result, "next_gate": "protocol_confirmation"})
+                TASK_STORE.checkpoint(task_id, stage="protocol", status="needs_attention", state=state)
             self.send_bytes(json.dumps(result, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+            return
+        if self.path == "/api/agent/chat":
+            task_id = str(payload.get("task_id", "")).strip()
+            message = str(payload.get("message", "")).strip()
+            if not task_id or not message:
+                self._send_error("task_id_and_message_required", 400)
+                return
+            if not model_status()["configured"]:
+                self._send_json({"error": "model_not_configured", "message": "A server-side model API key is required."}, 503)
+                return
+            if not self.model_request_allowed():
+                return
+            task = TASK_STORE.get(task_id)
+            if not task:
+                self._send_error("unknown_task", 404)
+                return
+            try:
+                reply = agent_reply(message, task)
+            except ModelError as exc:
+                self._send_json({"error": "model_request_failed", "message": str(exc)}, 502)
+                return
+            state = dict(task.get("state") or {})
+            messages = list(state.get("agent_messages") or [])
+            messages.extend((
+                {"role": "user", "content": message, "timestamp": utc_now()},
+                {"role": "assistant", "content": reply, "timestamp": utc_now(), "evidence_type": "model_advice"},
+            ))
+            state["agent_messages"] = messages[-40:]
+            TASK_STORE.checkpoint(task_id, state=state)
+            telemetry_event({"task_id": task_id, "event_type": "agent_message_completed", "stage": task.get("stage"), "status": "completed", "model": model_status()})
+            self._send_json({"reply": reply, "model": model_status(), "task_id": task_id, "evidence_type": "model_advice"})
             return
         if self.path == "/api/tasks":
             try:
@@ -980,6 +1057,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 4174
-    print("Research Evidence UI: http://127.0.0.1:{}".format(port))
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    port = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 4174))
+    host = os.environ.get("HOST", "0.0.0.0")
+    print("Research Evidence Agent: http://{}:{}".format(host, port))
+    ThreadingHTTPServer((host, port), Handler).serve_forever()

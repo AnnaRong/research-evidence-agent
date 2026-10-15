@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: research-evidence-agent
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: python3 ui/server.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5-mini
+      - key: REA_MODEL_REQUESTS_PER_HOUR
+        value: "20"
