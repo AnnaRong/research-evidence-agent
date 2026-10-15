@@ -1,0 +1,6 @@
+interface:
+  display_name: "科研证据综述 Agent"
+  short_description: "可审计地完成检索、筛选、证据提取、方法比较与创新性核验"
+  default_prompt: "Use $research-evidence-agent to build an auditable evidence review and bounded novelty analysis for my research question."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "elicit": {
+      "transport": "streamable_http",
+      "url": "https://elicit.com/api/mcp",
+      "auth": "oauth"
+    },
+    "edison": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["edison-mcp@latest", "stdio"],
+      "env": {
+        "EDISON_API_KEY": "<configure-in-client-secret-store>"
+      }
+    }
+  }
+}
