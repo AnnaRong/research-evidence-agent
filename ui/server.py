@@ -27,7 +27,7 @@ FEEDBACK_LOCK = threading.Lock()
 MODEL_RATE_LOCK = threading.Lock()
 MODEL_REQUESTS = {}
 sys.path.insert(0, str(REPO / "scripts"))
-from model_agent import ModelError, agent_reply, generate_protocol_with_model, model_status
+from model_agent import ModelError, agent_reply, available_models, generate_protocol_with_model, model_status
 from agent_pipeline import AgentPipeline
 from mcp_client import mcp_config
 
@@ -105,6 +105,17 @@ class TaskStore:
                     event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tool_approvals (
+                    approval_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL DEFAULT '{}',
+                    risk TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    decided_by TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -241,6 +252,36 @@ class TaskStore:
         with FEEDBACK_LOCK, self._connect() as connection:
             rows = connection.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT ?", (int(limit),)).fetchall()
             return [self._decode(row) for row in rows]
+
+    def events(self, task_id, limit=200):
+        with FEEDBACK_LOCK, self._connect() as connection:
+            rows = connection.execute("SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at, event_id LIMIT ?", (task_id, int(limit))).fetchall()
+            return [{"event_id": row["event_id"], "task_id": row["task_id"], "event_type": row["event_type"], "payload": json.loads(row["payload_json"]), "created_at": row["created_at"]} for row in rows]
+
+    def request_approval(self, task_id, tool_name, arguments, risk):
+        if not self.get(task_id):
+            raise KeyError("Unknown task: {}".format(task_id))
+        approval_id, timestamp = "approval-" + uuid.uuid4().hex[:12], utc_now()
+        with FEEDBACK_LOCK, self._connect() as connection:
+            connection.execute("INSERT INTO tool_approvals(approval_id, task_id, tool_name, arguments_json, risk, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (approval_id, task_id, tool_name, self._json(arguments), risk, timestamp, timestamp))
+            self._event(connection, task_id, "approval_requested", {"approval_id": approval_id, "tool_name": tool_name, "risk": risk})
+        return {"approval_id": approval_id, "task_id": task_id, "tool_name": tool_name, "arguments": arguments or {}, "risk": risk, "status": "pending", "created_at": timestamp}
+
+    def approvals(self, task_id):
+        with FEEDBACK_LOCK, self._connect() as connection:
+            rows = connection.execute("SELECT * FROM tool_approvals WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
+            return [{"approval_id": row["approval_id"], "task_id": row["task_id"], "tool_name": row["tool_name"], "arguments": json.loads(row["arguments_json"]), "risk": row["risk"], "status": row["status"], "decided_by": row["decided_by"], "created_at": row["created_at"], "updated_at": row["updated_at"]} for row in rows]
+
+    def decide_approval(self, task_id, approval_id, decision, decided_by="user"):
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("decision must be approved or rejected")
+        timestamp = utc_now()
+        with FEEDBACK_LOCK, self._connect() as connection:
+            cursor = connection.execute("UPDATE tool_approvals SET status = ?, decided_by = ?, updated_at = ? WHERE task_id = ? AND approval_id = ? AND status = 'pending'", (decision, decided_by, timestamp, task_id, approval_id))
+            if not cursor.rowcount:
+                raise KeyError("Unknown or already decided approval: {}".format(approval_id))
+            self._event(connection, task_id, "approval_decided", {"approval_id": approval_id, "decision": decision, "decided_by": decided_by})
+        return {"approval_id": approval_id, "task_id": task_id, "status": decision, "decided_by": decided_by, "updated_at": timestamp}
 
     def experiment_groups(self):
         with FEEDBACK_LOCK, self._connect() as connection:
@@ -867,7 +908,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/health":
-            self._send_json({"status": "ok", "mode": "public-agent", "model": model_status(), "mcp": mcp_config(), "pipeline": {"search": "live MCP required", "workers": ["SearchWorker", "ScreeningWorker", "ExtractionWorker", "NoveltyWorker", "SynthesisWorker"]}})
+            self._send_json({"status": "ok", "mode": "public-agent", "model": model_status(), "models": available_models(), "mcp": mcp_config(), "pipeline": {"search": "live MCP required", "workers": ["SearchWorker", "ScreeningWorker", "ExtractionWorker", "NoveltyWorker", "SynthesisWorker"]}})
             return
         if path == "/api/feedback/summary":
             self.send_bytes(json.dumps(feedback_summary(), ensure_ascii=False).encode(), "application/json; charset=utf-8")
@@ -888,6 +929,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = TASK_STORE.get(task_id)
             elif len(parts) == 4 and parts[3] == "gates":
                 result = {"task_id": task_id, "gates": TASK_STORE.gates(task_id)}
+            elif len(parts) == 4 and parts[3] == "events":
+                result = {"task_id": task_id, "events": TASK_STORE.events(task_id)}
+            elif len(parts) == 4 and parts[3] == "approvals":
+                result = {"task_id": task_id, "approvals": TASK_STORE.approvals(task_id)}
             else:
                 result = None
             if result is not None:
@@ -991,6 +1036,18 @@ class Handler(BaseHTTPRequestHandler):
             result = PIPELINE.start(task_id, stage, question, payload.get("protocol") or (task.get("state") or {}).get("protocol") or {}, payload.get("contribution"))
             self._send_json(result)
             return
+        if self.path == "/api/tools/approval":
+            task_id = str(payload.get("task_id", "")).strip()
+            tool_name = str(payload.get("tool_name", "")).strip()
+            risk = str(payload.get("risk", "high")).strip()
+            if not task_id or not tool_name or risk not in {"medium", "high"}:
+                self._send_error("task_id, tool_name, and medium/high risk are required", 400)
+                return
+            try:
+                self._send_json(TASK_STORE.request_approval(task_id, tool_name, payload.get("arguments") or {}, risk))
+            except KeyError as exc:
+                self._send_error(str(exc), 404)
+            return
         if self.path == "/api/tasks":
             try:
                 result = TASK_STORE.create(
@@ -1023,6 +1080,10 @@ class Handler(BaseHTTPRequestHandler):
                     result = TASK_STORE.retry(task_id, payload.get("tool"))
                 elif len(parts) == 4 and parts[3] == "skip":
                     result = TASK_STORE.skip(task_id, payload.get("reason", "user_requested_skip"))
+                elif len(parts) == 4 and parts[3] == "cancel":
+                    result = PIPELINE.cancel(task_id)
+                elif len(parts) == 6 and parts[3] == "approvals" and parts[5] == "decide":
+                    result = TASK_STORE.decide_approval(task_id, parts[4], payload.get("decision"), payload.get("decided_by", "user"))
                 elif len(parts) == 5 and parts[3] == "gates" and parts[4] == "confirm":
                     result = TASK_STORE.confirm_gate(task_id, payload.get("gate_name"), payload.get("confirmed_by", "user"), payload.get("metadata"))
                 else:

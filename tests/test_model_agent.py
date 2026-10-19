@@ -47,6 +47,26 @@ class ModelAgentTest(unittest.TestCase):
         self.assertEqual(status, {"configured": True, "provider": "openai-compatible", "model": "gateway-model"})
         self.assertNotIn("gateway-secret", json.dumps(status))
 
+    def test_local_openai_compatible_model_is_supported(self):
+        with patch.dict("os.environ", {"LOCAL_LLM_BASE_URL": "http://127.0.0.1:11434/v1", "LOCAL_LLM_MODEL": "qwen"}, clear=True):
+            self.assertEqual(model_agent.model_status(), {"configured": True, "provider": "local-openai-compatible", "model": "qwen"})
+
+    def test_json_schema_rejects_missing_required_field(self):
+        with self.assertRaises(model_agent.ModelError) as raised:
+            model_agent.validate_json_schema({}, {"type": "object", "required": ["result"]})
+        self.assertEqual(raised.exception.category, "schema_validation")
+
+    def test_model_retry_falls_back_to_next_provider(self):
+        configs = [{"provider": "first", "model": "a"}, {"provider": "second", "model": "b"}]
+        def invoke(config, *_args, **_kwargs):
+            if config["provider"] == "first":
+                raise model_agent.ModelError("temporary", "timeout", True)
+            return {"text": "ok", "provider": "second", "model": "b", "usage": {"total_tokens": 3}}
+        with patch.object(model_agent, "model_configs", return_value=configs), patch.object(model_agent, "_invoke", side_effect=invoke), patch.object(model_agent.time, "sleep"):
+            result = model_agent.complete_result("system", "user", retries=1)
+        self.assertEqual(result["text"], "ok")
+        self.assertEqual(result["fallback_count"], 2)
+
     def test_protocol_schema_is_model_generated(self):
         response = {
             "framework": "PEO",
@@ -58,7 +78,8 @@ class ModelAgentTest(unittest.TestCase):
             "exclusion_criteria": ["Editorials"],
             "limitations": ["Language limits"],
         }
-        with patch.object(model_agent, "complete_json", return_value=response):
+        wrapped = {"value": response, "provider": "test", "model": "test-model", "usage": {"total_tokens": 1}, "attempts": 1, "fallback_count": 0, "duration_ms": 1}
+        with patch.object(model_agent, "complete_json", return_value=wrapped):
             result = model_agent.generate_protocol_with_model("Question", ["evidence"])
         self.assertEqual(result["generated_by"], "llm_supervisor")
         self.assertTrue(result["editable"])

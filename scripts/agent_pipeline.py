@@ -4,6 +4,7 @@
 import json
 import re
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from mcp_client import MCPError, call_tool, mcp_config
 
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 URL_RE = re.compile(r"https?://[^\s)<>]+")
+MAX_TOOL_OUTPUT_CHARS = 100_000
 
 
 def now():
@@ -78,6 +80,18 @@ def _error(exc):
     return {"category": getattr(exc, "category", "mcp_error"), "message": str(exc), "retryable": getattr(exc, "retryable", True), "suggested_actions": ["retry", "switch_tool", "manual_upload"]}
 
 
+def normalize_tool_result(result, limit=MAX_TOOL_OUTPUT_CHARS):
+    """Keep structured tool metadata while bounding context and checkpoint size."""
+    normalized = dict(result) if isinstance(result, dict) else {"result": result}
+    text = str(normalized.get("text", ""))
+    if len(text) > limit:
+        normalized["text"] = text[:limit]
+        normalized["truncated"] = True
+        normalized["original_text_chars"] = len(text)
+    normalized.setdefault("truncated", False)
+    return normalized
+
+
 class AgentPipeline:
     def __init__(self, task_store, telemetry, checkpoint):
         self.task_store = task_store
@@ -96,20 +110,39 @@ class AgentPipeline:
             thread.start()
         return {"accepted": True, "status": "running", "task_id": task_id, "stage": stage}
 
+    def cancel(self, task_id):
+        task = self.task_store.get(task_id)
+        if not task:
+            raise KeyError("Unknown task: {}".format(task_id))
+        state = dict(task.get("state") or {})
+        state["cancel_requested"] = True
+        state["cancel_requested_at"] = now()
+        return self.checkpoint(task_id, status="cancelling", state=state)
+
+    def _cancelled(self, task_id):
+        return bool(((self.task_store.get(task_id) or {}).get("state") or {}).get("cancel_requested"))
+
     def _save(self, task_id, stage, status, state, error=None):
         self.checkpoint(task_id, stage=stage, status=status, state=state, error=error)
 
     def _call(self, task_id, stage, worker, server, tool, arguments):
-        started = datetime.now(timezone.utc)
-        self.telemetry({"task_id": task_id, "event_type": "api_call_started", "stage": stage, "worker": worker, "metadata": {"provider": server, "tool": tool}})
-        try:
-            result = call_tool(server, tool, arguments)
-            elapsed = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-            self.telemetry({"task_id": task_id, "event_type": "api_call_completed", "stage": stage, "worker": worker, "duration_ms": elapsed, "metadata": {"provider": server, "tool": tool, "estimated_cost_usd": 0}})
-            return result
-        except MCPError as exc:
-            self.telemetry({"task_id": task_id, "event_type": "worker_failed", "stage": stage, "worker": worker, "status": "failed", "metadata": {"provider": server, "tool": tool, "category": exc.category}})
-            raise
+        retries = 2
+        for attempt in range(retries + 1):
+            if self._cancelled(task_id):
+                raise MCPError("Task was cancelled by the user", "cancelled", False)
+            started = datetime.now(timezone.utc)
+            self.telemetry({"task_id": task_id, "event_type": "api_call_started", "stage": stage, "worker": worker, "metadata": {"provider": server, "tool": tool, "attempt": attempt + 1}})
+            try:
+                result = normalize_tool_result(call_tool(server, tool, arguments))
+                elapsed = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                self.telemetry({"task_id": task_id, "event_type": "api_call_completed", "stage": stage, "worker": worker, "duration_ms": elapsed, "metadata": {"provider": server, "tool": tool, "attempt": attempt + 1, "estimated_cost_usd": 0, "truncated": result["truncated"]}})
+                return result
+            except MCPError as exc:
+                self.telemetry({"task_id": task_id, "event_type": "worker_failed", "stage": stage, "worker": worker, "status": "failed", "metadata": {"provider": server, "tool": tool, "attempt": attempt + 1, "category": exc.category}})
+                if not exc.retryable or attempt == retries:
+                    raise
+                self.telemetry({"task_id": task_id, "event_type": "worker_retried", "stage": stage, "worker": worker, "status": "running", "metadata": {"provider": server, "tool": tool, "attempt": attempt + 2}})
+                time.sleep(0.25 * (2 ** attempt))
 
     def run(self, task_id, stage, question, protocol, contribution):
         try:
@@ -129,7 +162,8 @@ class AgentPipeline:
             task = self.task_store.get(task_id) or {}
             state = dict(task.get("state") or {})
             state["last_failed_stage"] = stage
-            self._save(task_id, stage, "needs_attention", state, _error(exc))
+            status = "cancelled" if exc.category == "cancelled" else "needs_attention"
+            self._save(task_id, stage, status, state, _error(exc))
 
     def search(self, task_id, question, protocol):
         config = mcp_config()

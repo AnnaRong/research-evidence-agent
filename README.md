@@ -4,7 +4,8 @@ An auditable literature-research web agent built around a server-side LLM Superv
 
 ## Features
 
-- Server-side OpenAI or Anthropic model integration for protocol generation and Agent chat.
+- Server-side OpenAI, Anthropic, approved OpenAI-compatible gateway, or local OpenAI-compatible model integration.
+- Model timeouts, exponential retry, provider fallback, JSON Schema validation, token usage, and configurable cost estimates.
 - Server-side MCP Runner for live Elicit and Edison Worker calls.
 - Research-question protocol generation and human confirmation gates.
 - Search and screening workspace with PRISMA progress.
@@ -12,6 +13,7 @@ An auditable literature-research web agent built around a server-side LLM Superv
 - Bounded novelty analysis and method comparison outputs.
 - CSV, XLSX, DOCX, PDF-print, Markdown, and CSV-bundle exports.
 - SQLite checkpoints for resumable tasks.
+- Per-task event replay, cancellation flags, and persisted medium/high-risk tool approvals.
 - Worker failure handling, retries, tool switching, stage skipping, and cost limits.
 - Feedback loops for screening, extraction, and novelty decisions.
 - A/B assignment between `elicit_only` and `elicit_edison` pipelines.
@@ -28,6 +30,20 @@ export OPENAI_MODEL="gpt-5-mini"
 export ELICIT_MCP_TOKEN="..."
 export EDISON_API_KEY="..."
 ```
+
+Optional resilience and accounting settings:
+
+```bash
+export LLM_MAX_RETRIES=2
+export LLM_TIMEOUT_SECONDS=90
+export LLM_INPUT_USD_PER_1M=0
+export LLM_OUTPUT_USD_PER_1M=0
+# Local OpenAI-compatible server (Ollama/vLLM/etc.)
+export LOCAL_LLM_BASE_URL="http://127.0.0.1:11434/v1"
+export LOCAL_LLM_MODEL="your-local-model"
+```
+
+The first configured provider is primary; retryable failures fall through to the next configured provider. Keys remain server-side. Local HTTP endpoints are restricted to loopback hosts.
 
 The local server also accepts the same approved OpenAI-compatible gateway contract used by the recruiting Agent:
 
@@ -74,6 +90,15 @@ python3 -m py_compile ui/server.py scripts/model_agent.py
 node --check ui/app.js
 python3 -m unittest discover -s tests -v
 ```
+
+## Runtime Control APIs
+
+- `GET /api/tasks/{task_id}/events`: replay persisted task/checkpoint/approval events.
+- `POST /api/tasks/{task_id}/cancel`: request cooperative cancellation.
+- `POST /api/tools/approval`: create a persisted medium/high-risk action approval.
+- `POST /api/tasks/{task_id}/approvals/{approval_id}/decide`: approve or reject it.
+
+This MVP executes only the registered Elicit/Edison research tools. General shell, file mutation, HTTP, and browser tools are deliberately not exposed to model-selected execution; add each behind an allowlist and the approval API only when a concrete workflow needs it. SSE streaming and cross-session vector memory are also deferred because the current UI and bounded task checkpoints do not require them.
 
 ## MCP Configuration
 

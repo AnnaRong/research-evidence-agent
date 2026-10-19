@@ -34,6 +34,19 @@ class ResilienceTest(unittest.TestCase):
             self.assertEqual(gate["status"], "confirmed")
             self.assertEqual(next(row for row in store.gates("task-1") if row["gate_name"] == "screening_criteria_confirmation")["status"], "confirmed")
 
+    def test_tool_approval_and_event_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = TaskStore(Path(temporary) / "state.sqlite3")
+            store.create(task_id="task-approval")
+            approval = store.request_approval("task-approval", "shell", {"command": "rm example"}, "high")
+            self.assertEqual(approval["status"], "pending")
+            decided = store.decide_approval("task-approval", approval["approval_id"], "rejected")
+            self.assertEqual(decided["status"], "rejected")
+            self.assertEqual(store.approvals("task-approval")[0]["status"], "rejected")
+            event_types = [row["event_type"] for row in store.events("task-approval")]
+            self.assertIn("approval_requested", event_types)
+            self.assertIn("approval_decided", event_types)
+
     def test_cost_near_limit_warning_and_config(self):
         with tempfile.TemporaryDirectory() as temporary:
             analytics = Path(temporary)
