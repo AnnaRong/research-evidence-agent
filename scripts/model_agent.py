@@ -13,12 +13,28 @@ class ModelError(RuntimeError):
 
 
 def model_config():
+    # Match TalentPilot's approved OpenAI-compatible gateway contract first.
+    # The key stays server-side; the browser never receives it.
+    gateway_key = os.environ.get("LLM_API_KEY", "").strip()
+    gateway_enabled = os.environ.get("LLM_EGRESS_ENABLED", "0") == "1"
+    if gateway_key and gateway_enabled:
+        base_url = os.environ.get("LLM_BASE_URL", "").strip().rstrip("/")
+        allowed_host = os.environ.get("LLM_ALLOWED_HOST", "").strip()
+        if base_url.startswith("https://") and (not allowed_host or base_url.split("/", 3)[2] == allowed_host):
+            return {
+                "provider": "openai-compatible",
+                "base_url": base_url,
+                "api_key": gateway_key,
+                "model": os.environ.get("LLM_MODEL", "gpt-5-mini"),
+                "endpoint": "chat/completions",
+            }
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
         return {
             "provider": "anthropic",
             "base_url": os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/"),
             "api_key": os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"),
             "model": os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+            "endpoint": "messages",
         }
     if os.environ.get("OPENAI_API_KEY"):
         return {
@@ -26,6 +42,7 @@ def model_config():
             "base_url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
             "api_key": os.environ["OPENAI_API_KEY"],
             "model": os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
+            "endpoint": "responses",
         }
     return None
 
@@ -55,6 +72,23 @@ def complete(system, user, max_tokens=1400):
     config = model_config()
     if not config:
         raise ModelError("No model API key configured")
+    if config["provider"] == "openai-compatible":
+        payload = {"model": config["model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], "max_completion_tokens": max_tokens}
+        if "json" in system.lower() or "json" in user.lower():
+            payload["response_format"] = {"type": "json_object"}
+        data = _request(
+            config["base_url"] + "/chat/completions",
+            {"Content-Type": "application/json", "Authorization": "Bearer " + config["api_key"]},
+            payload,
+        )
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            raise ModelError("OpenAI-compatible gateway returned no choices")
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "".join(item.get("text", "") for item in content if isinstance(item, dict))
+        return str(content).strip()
     if config["provider"] == "anthropic":
         data = _request(
             config["base_url"] + "/v1/messages",
@@ -93,7 +127,7 @@ def complete_json(system, user, max_tokens=1400):
 
 def generate_protocol_with_model(question, outputs):
     result = complete_json(
-        "You are the Supervisor of an auditable scientific evidence agent. You design the protocol but never invent papers, citations, search results, or effect sizes.",
+        "You are the Supervisor of an auditable scientific evidence agent. Design only a concise search protocol. Never invent papers, citations, search results, or effect sizes. Keep population, exposure, outcome, and query under 300 characters each. Return at most three short inclusion criteria, three short exclusion criteria, and three short limitations. Do not add output-specific tables or narrative sections.",
         json.dumps(
             {
                 "task": "Create an editable PICO or PEO literature-review protocol",
@@ -112,6 +146,7 @@ def generate_protocol_with_model(question, outputs):
             },
             ensure_ascii=False,
         ),
+        360,
     )
     required = ("framework", "population", "exposure", "outcome", "query")
     if any(not str(result.get(key, "")).strip() for key in required):

@@ -832,6 +832,16 @@ def bundle_bytes():
 
 
 class Handler(BaseHTTPRequestHandler):
+    CORS_ORIGINS = {"null", "http://127.0.0.1:4174", "http://localhost:4174"}
+
+    def send_cors_headers(self):
+        origin = self.headers.get("Origin")
+        if origin in self.CORS_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+
     def model_request_allowed(self):
         forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
         allowed, limit = allow_model_request(forwarded or self.client_address[0])
@@ -842,6 +852,7 @@ class Handler(BaseHTTPRequestHandler):
     def send_bytes(self, data, content_type, filename=None):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_cors_headers()
         self.send_header("Content-Length", str(len(data)))
         if filename:
             self.send_header("Content-Disposition", 'attachment; filename="{}"'.format(filename))
@@ -894,6 +905,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self.send_bytes(file_path.read_bytes(), mimetypes.guess_type(file_path.name)[0] or "application/octet-stream")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_cors_headers()
+        self.end_headers()
 
     def do_POST(self):
         try:
@@ -1074,6 +1090,7 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(value, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_cors_headers()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1084,6 +1101,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 4174))
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     print("Research Evidence Agent: http://{}:{}".format(host, port))
     ThreadingHTTPServer((host, port), Handler).serve_forever()

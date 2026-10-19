@@ -29,6 +29,18 @@ export ELICIT_MCP_TOKEN="..."
 export EDISON_API_KEY="..."
 ```
 
+The local server also accepts the same approved OpenAI-compatible gateway contract used by the recruiting Agent:
+
+```bash
+export LLM_API_KEY="..."
+export LLM_EGRESS_ENABLED=1
+export LLM_BASE_URL="https://your-approved-gateway.example/v1"
+export LLM_ALLOWED_HOST="your-approved-gateway.example"
+export LLM_MODEL="gpt-5-mini"
+```
+
+When opening `ui/index.html` directly as a `file://` preview, the UI sends API requests to `http://127.0.0.1:4174`. Start the server from this repository first; a deployed Worker page uses its own same-origin `/api` routes.
+
 Without a configured model, `/api/protocol` and `/api/agent/chat` return HTTP 503. The application does not silently fall back to a rule template.
 
 ## Cloudflare Free MVP

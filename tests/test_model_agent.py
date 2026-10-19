@@ -32,6 +32,21 @@ class ModelAgentTest(unittest.TestCase):
             self.assertEqual(status, {"configured": True, "provider": "openai", "model": "test-model"})
             self.assertNotIn("secret", json.dumps(status))
 
+    def test_recruiting_gateway_contract_is_supported_without_exposing_key(self):
+        environment = {
+            "LLM_API_KEY": "gateway-secret",
+            "LLM_EGRESS_ENABLED": "1",
+            "LLM_BASE_URL": "https://gateway.test/v1",
+            "LLM_ALLOWED_HOST": "gateway.test",
+            "LLM_MODEL": "gateway-model",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = model_agent.model_config()
+            status = model_agent.model_status()
+        self.assertEqual(config["endpoint"], "chat/completions")
+        self.assertEqual(status, {"configured": True, "provider": "openai-compatible", "model": "gateway-model"})
+        self.assertNotIn("gateway-secret", json.dumps(status))
+
     def test_protocol_schema_is_model_generated(self):
         response = {
             "framework": "PEO",
