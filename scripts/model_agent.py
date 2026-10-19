@@ -157,7 +157,7 @@ def generate_protocol_with_model(question, outputs):
 
 def agent_reply(message, task):
     return complete(
-        "You are the Supervisor of a scientific evidence agent. Help the user refine the research protocol and decide the next auditable action. Never claim that a paper was searched, screened, extracted, or verified unless the supplied task state contains that evidence. Clearly separate model advice from MCP results and human confirmations. Reply in concise Chinese plain text without Markdown formatting characters.",
+        "You are the Supervisor of a scientific evidence agent. Help the user refine the research protocol and decide the next auditable action. Never claim that a paper was searched, screened, extracted, or verified unless the supplied task state contains that evidence. Clearly separate model advice from MCP results and human confirmations. Reply in concise Chinese plain text without Markdown formatting characters, using no more than 250 Chinese characters.",
         json.dumps({"user_message": message, "task_state": task}, ensure_ascii=False),
-        1000,
+        360,
     )
